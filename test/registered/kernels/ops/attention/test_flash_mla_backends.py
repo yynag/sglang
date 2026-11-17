@@ -22,6 +22,7 @@ DSv4 cache layout (per page):
 from __future__ import annotations
 
 import unittest
+import weakref
 from unittest import mock
 
 import torch
@@ -50,6 +51,7 @@ from sglang.kernels.ops.attention.flash_mla_sm120_triton import (
     _merge_partial_attn,
     flash_mla_sparse_decode_triton,
 )
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_resources
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -603,6 +605,13 @@ class TestTouchedPageSplit(CustomTestCase):
             raise unittest.SkipTest("CUDA required")
         cls.device = torch.device("cuda")
 
+    def setUp(self):
+        super().setUp()
+        if self._testMethodName == "test_capture_then_grow_then_replay":
+            # The retry count is read before entering the test method. A real
+            # failure must not become an inconclusive SkipTest on a later try.
+            self.enterContext(envs.SGLANG_TEST_MAX_RETRY.override(0))
+
     def test_only_marked_pages_are_split(self):
         num_pages = 3
         ratio = _PBS_SRC // _PBS_DST
@@ -707,6 +716,141 @@ class TestTouchedPageSplit(CustomTestCase):
             bool((dst[ratio : 2 * ratio] == sentinel).all()),
             "sub-pages of untouched source page 1 were rewritten",
         )
+
+    def test_capture_then_grow_then_replay(self):
+        """A larger pool must not invalidate addresses baked into an older graph.
+
+        Do not retain the old split/mask tensors in this test: that would hide
+        a missing production owner. Only the graph's independent observation
+        tensor is kept alive across the grow-and-replace calls.
+        """
+        buffers = get_resources().buffers
+        small, _ = _build_kvcache(2, _PBS_SRC, device=self.device, seed=23)
+        keys = (
+            f"flash_mla_sm120_split:{small.device}",
+            f"flash_mla_sm120_mask:{small.device}",
+        )
+        missing = object()
+        for key in keys:
+            old = buffers.pop(key, missing)
+
+            def restore(key=key, old=old):
+                if old is missing:
+                    buffers.pop(key, None)
+                else:
+                    buffers[key] = old
+
+            self.addCleanup(restore)
+
+        large, _ = _build_kvcache(7, _PBS_SRC, device=self.device, seed=29)
+        small_indices = (
+            torch.arange(2, device=small.device, dtype=torch.int32) * _PBS_SRC
+        )
+        large_indices = (
+            torch.arange(7, device=small.device, dtype=torch.int32) * _PBS_SRC
+        )
+
+        def snapshot(cache, indices):
+            split = _split_kv_pages_to_64(
+                cache.view(torch.uint8), _PBS_SRC, touched_indices=indices
+            )
+            return split.as_strided(
+                (cache.shape[0] * (_PBS_SRC // _PBS_DST), _BYTES_PER_DST_PAGE),
+                (_BYTES_PER_DST_PAGE_PADDED, 1),
+            ).clone()
+
+        def reference(cache):
+            stride = cache.stride(0)
+            raw = cache.as_strided((cache.shape[0], stride), (stride, 1)).view(
+                torch.uint8
+            )
+            data = _PBS_DST * _NOPE_ROPE_STRIDE
+            scales = _PBS_DST * _SCALE_STRIDE
+            scale_start = _PBS_SRC * _NOPE_ROPE_STRIDE
+            return torch.stack(
+                [
+                    torch.cat(
+                        (
+                            page[sub * data : (sub + 1) * data],
+                            page[
+                                scale_start
+                                + sub * scales : scale_start + (sub + 1) * scales
+                            ],
+                        )
+                    )
+                    for page in raw
+                    for sub in range(_PBS_SRC // _PBS_DST)
+                ]
+            )
+
+        for _ in range(3):
+            snapshot(small, small_indices)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            observed = snapshot(small, small_indices)
+        retired = {
+            key: (
+                weakref.ref(buffers[key]),
+                buffers[key].data_ptr(),
+                buffers[key].numel() * buffers[key].element_size(),
+            )
+            for key in keys
+        }
+        before = tuple(buffers[key].data_ptr() for key in keys)
+
+        snapshot(large, large_indices)
+        after = tuple(buffers[key].data_ptr() for key in keys)
+        self.assertTrue(all(a != b for a, b in zip(before, after)))
+        # Exercise allocator reuse without keeping a reference to either retired
+        # buffer. Old graph writes must not corrupt these unrelated allocations.
+        scratch = [
+            torch.full(
+                (8, _BYTES_PER_DST_PAGE_PADDED),
+                0xA5,
+                device=small.device,
+                dtype=torch.uint8,
+            ),
+            torch.full((2,), 0x35, device=small.device, dtype=torch.int8),
+        ]
+        scratch_ranges = [
+            (t.data_ptr(), t.data_ptr() + t.numel() * t.element_size())
+            for t in scratch
+        ]
+        reused = {
+            key: any(start < ptr + size and ptr < end for start, end in scratch_ranges)
+            for key, (_, ptr, size) in retired.items()
+        }
+        tensor_owners_alive = {
+            key: ref() is not None for key, (ref, _, _) in retired.items()
+        }
+        print(
+            "page-split lifetime diagnostic:",
+            {
+                "retired": {
+                    key: (ptr, size) for key, (_, ptr, size) in retired.items()
+                },
+                "scratch": scratch_ranges,
+                "overlap": reused,
+                "retired_tensor_alive": tensor_owners_alive,
+            },
+        )
+        small.view(torch.uint8).bitwise_xor_(0x5A)
+        expected = reference(small)
+        for _ in range(3):
+            graph.replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(observed, expected, atol=0, rtol=0)
+            for tensor, value in zip(scratch, (0xA5, 0x35)):
+                self.assertTrue(bool((tensor == value).all()))
+        self.assertEqual(tuple(buffers[key].data_ptr() for key in keys), after)
+        unexercised = [
+            key for key in keys if not reused[key] and not tensor_owners_alive[key]
+        ]
+        if unexercised:
+            self.skipTest(
+                "lifetime inconclusive: no scratch reuse or live Python tensor owner "
+                f"observed for {unexercised}; graph output alone is not owner evidence"
+            )
 
 
 if __name__ == "__main__":

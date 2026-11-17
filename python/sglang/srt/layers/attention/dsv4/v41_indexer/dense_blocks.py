@@ -97,6 +97,7 @@ class DenseBlocksBackend:
             inputs=inputs,
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
+            allow_paged=self.block_size == 8,
         )
         if d is None:
             return None
@@ -131,6 +132,7 @@ class DenseBlocksBackend:
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
             candidate_mask=published.decode_mask if published is not None else None,
+            allow_paged=self.block_size == 8,
         )
         if d is None:
             return

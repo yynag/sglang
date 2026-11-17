@@ -557,13 +557,17 @@ def decode_scores(
     req_to_token: torch.Tensor,
     candidate_mask: Optional[torch.Tensor] = None,
     compute_topk_plan: bool = True,
+    allow_paged: bool = True,
 ) -> Optional[DecodeScores | PagedDecodeScores]:
     """None when there is no row, or nothing visible yet."""
     pool = token_to_kv_pool
     ratio = inputs.compress_ratio
     indexer = inputs.indexer
     req, pos = inputs.req_rows, inputs.positions
-    paged = get_platform().is_sm90
+    platform = get_platform()
+    # DenseBlocks decode reads only visible positions on Hopper and SM120;
+    # FullTopK keeps its separate dense DeepGEMM dispatch on SM100+.
+    paged = allow_paged and (platform.is_sm90 or platform.is_sm120)
     bs = req.shape[0]
     assert pos.shape[0] == bs, (
         f"decode expects one token per request, {pos.shape=} {bs=}"

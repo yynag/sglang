@@ -1056,11 +1056,14 @@ def test_sm120_c4_native_planner_consumer_replay(fp4):
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9,
-    reason="Hopper paged indexer dispatch",
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability()[0] not in (9, 12),
+    reason="Hopper or SM120 paged candidate indexer dispatch",
 )
 @pytest.mark.parametrize("ratio", [1, 2])
-def test_hopper_indexer_backends_replay(ratio):
+@pytest.mark.parametrize("heads", [32, 64])
+@pytest.mark.parametrize("zero_queries", [False, True])
+def test_paged_candidate_backends_replay(ratio, heads, zero_queries):
     from sglang.srt.layers.attention.dsv4.v41_indexer import scoring
     from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import (
         DenseBlocksBackend,
@@ -1071,7 +1074,9 @@ def test_hopper_indexer_backends_replay(ratio):
     )
 
     batch, width, capacity, topk = 12, 193, 32772, 64
-    q, weights, slots, lens, table = _make_logits_case(batch, 32, width)
+    q, weights, slots, lens, table = _make_logits_case(batch, heads, width)
+    if zero_queries:
+        q.zero_()
     consumer_q = -q
     req = torch.arange(batch, device=q.device, dtype=torch.int32) // 6
     req_table = torch.full(
@@ -1103,8 +1108,14 @@ def test_hopper_indexer_backends_replay(ratio):
         is_verify=True,
     )
     kwargs = dict(token_to_kv_pool=pool, req_to_token=req_table)
-    full = FullTopKIndexer(
-        **kwargs, use_deep_gemm_prefill=False, use_deep_gemm_decode=False
+    # Hopper FullTopK shares this paged Triton scorer. SM120 FullTopK is tested
+    # separately with its real DeepGEMM planner, not forced onto a fallback here.
+    full = (
+        FullTopKIndexer(
+            **kwargs, use_deep_gemm_prefill=False, use_deep_gemm_decode=False
+        )
+        if torch.cuda.get_device_capability()[0] == 9
+        else None
     )
     candidates = DenseBlocksBackend(
         **kwargs,
@@ -1120,11 +1131,14 @@ def test_hopper_indexer_backends_replay(ratio):
             page_indices=torch.empty(shape, device=q.device, dtype=torch.int32),
             raw_indices=None,
         )
-        for shape in ((batch, topk), (batch + 1, topk + 8), (batch + 1, topk + 8))
+        for shape in (
+            ([(batch, topk)] if full is not None else [])
+            + [(batch + 1, topk + 8), (batch + 1, topk + 8)]
+        )
     ]
     decode_inputs = [
         DecodeInputs(
-            q_lora=q if i < 2 else consumer_q,
+            q_lora=q if i < len(outputs) - 1 else consumer_q,
             out_page_indices=out.page_indices,
             **common,
         )
@@ -1140,9 +1154,10 @@ def test_hopper_indexer_backends_replay(ratio):
         return result
 
     def run():
-        full.topk_decode(decode_inputs[0])
-        published = candidates.publish_decode(decode_inputs[1])
-        candidates.consume_decode(decode_inputs[2], published)
+        if full is not None:
+            full.topk_decode(decode_inputs[0])
+        published = candidates.publish_decode(decode_inputs[-2])
+        candidates.consume_decode(decode_inputs[-1], published)
         return published
 
     for _ in range(3):
@@ -1152,12 +1167,14 @@ def test_hopper_indexer_backends_replay(ratio):
         with torch.cuda.graph(graph):
             published = run()
     assert (
-        len(captured_scores) == 3
-    )  # all three runtime entrypoints took the paged path
+        len(captured_scores) == len(outputs)
+    )  # every tested runtime entrypoint took the paged path
     mask = published.decode_mask
-    assert captured_masks[:2] == [None, None]
-    assert captured_masks[2] is mask
-    for step, visible in enumerate([193, 0, 1, 7, 8, 9, 65, 193]):
+    assert captured_masks[:-1] == [None] * (len(outputs) - 1)
+    assert captured_masks[-1] is mask
+    for step, visible in enumerate(
+        [193, 0, 1, 7, 8, 9, 63, 64, 65, 127, 128, 129, 193]
+    ):
         # -1 positions exercise zero-length padded rows, also for ratio 1.
         lens.copy_((visible - torch.arange(batch, device=q.device) % 6).clamp_min(0))
         positions.copy_(lens * ratio - 1)
@@ -1196,7 +1213,8 @@ def test_hopper_indexer_backends_replay(ratio):
             torch.testing.assert_close(mask[row, :width], keep)
             consumer_scores[row].masked_fill_(~keep, -torch.inf)
             for out, scores in zip(
-                outputs, (source_scores, source_scores, consumer_scores)
+                outputs,
+                (source_scores,) * (len(outputs) - 1) + (consumer_scores,),
             ):
                 pages = out.page_indices[row]
                 pages = pages[pages >= 0]
@@ -1219,7 +1237,7 @@ def test_hopper_indexer_backends_replay(ratio):
                     expected_raw = torch.full_like(out.raw_indices[row], -1)
                     expected_raw[:count] = selected.sort().values.int()
                     torch.testing.assert_close(out.raw_indices[row], expected_raw)
-        for out in outputs[1:]:
+        for out in outputs[-2:]:
             assert (out.page_indices[batch] == -1).all().item()
             if out.raw_indices is not None:
                 assert (out.raw_indices[batch] == -1).all().item()
