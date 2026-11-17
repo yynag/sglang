@@ -1409,6 +1409,7 @@ class DeepseekV4AttnBackend(
             index_heads=int(cfg.index_n_heads),
             index_topk=self.index_topk,
         )
+        self._deep_gemm_decode_ratios = self._get_deep_gemm_decode_ratios(cfg)
         self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
 
         assert isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
@@ -1636,6 +1637,53 @@ class DeepseekV4AttnBackend(
             online_state_slot_offset=online_c128_state_slot_offset,
         )
 
+    def _get_deep_gemm_decode_ratios(self, cfg) -> frozenset[int]:
+        """Ratios with an ordinary paged-logits consumer on this PP stage."""
+        candidate_source = getattr(cfg, "candidate_source_layer_id", -1)
+        return frozenset(
+            cfg.compress_ratios[layer_id]
+            for layer_id in getattr(cfg, "index_source_layer_ids", ())
+            if layer_id in self.token_to_kv_pool.stage_layer_ids
+            and (
+                (
+                    self.full_topk_indexer.use_deep_gemm_decode
+                    and (candidate_source < 0 or layer_id < candidate_source)
+                )
+                or (
+                    layer_id == candidate_source
+                    and isinstance(self.decode_candidates, SparseTableBackend)
+                )
+            )
+        )
+
+    def _uses_deep_gemm_indexer_metadata(self, compress_ratio: int) -> bool:
+        if compress_ratio == 4:
+            return _is_cuda and (
+                self.enable_deepseek_v4_fp4_indexer
+                or not (
+                    envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
+                    or envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+                )
+            )
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            get_capture_attention_variant,
+            skip_candidate_filtering,
+            skip_low_ratio_indexer,
+        )
+
+        if skip_low_ratio_indexer(compress_ratio):
+            return False
+        # The unfiltered graph runs FullTopK even for candidate layers. Filtered
+        # DenseBlocks consumers need no schedule unless early verify shares their
+        # metadata and glue graph with the unfiltered variant.
+        unfiltered = skip_candidate_filtering() or (
+            self.builds_verify_metadata_early
+            and get_capture_attention_variant() in DSV41_EARLY_VERIFY_VARIANTS
+        )
+        return compress_ratio in self._deep_gemm_decode_ratios or (
+            unfiltered and self.full_topk_indexer.use_deep_gemm_decode
+        )
+
     def init_forward_metadata_indexer(
         self,
         core_attn_metadata: DSV4AttnMetadata,
@@ -1667,16 +1715,18 @@ class DeepseekV4AttnBackend(
             )
         else:
             raise ValueError(f"Unsupported indexer {compress_ratio = }")
+        use_deep_gemm_metadata = self._uses_deep_gemm_indexer_metadata(compress_ratio)
         return PagedIndexerMetadata(
             page_size=self.page_size,
             compressed_page_size=index_page_size or self.page_size // compress_ratio,
             page_table=page_table,
             compressed_seq_lens=c_seq_lens,
             use_topk_v2=self.dsa_topk_backend.should_use_topk_v2() and not _is_xpu,
-            # The SM120 FP4 kernel schedules split_kv=128, while the generic
-            # JIT metadata planner encodes split_kv=256.
+            use_deep_gemm_metadata=use_deep_gemm_metadata,
+            # Let DeepGEMM own its SM120 kernel/planner contract, independently
+            # of the C4 FP4 switch and the FP8-only Torch fallback.
             force_deep_gemm_metadata=(
-                self.enable_deepseek_v4_fp4_indexer and get_platform().is_sm120
+                use_deep_gemm_metadata and get_platform().is_sm120
             ),
             use_prefill_cuda_graph=use_prefill_cuda_graph,
             compress_ratio=compress_ratio,
@@ -2758,8 +2808,8 @@ class DeepseekV4AttnBackend(
         """Build what ``init_forward_metadata_in_graph`` records for target verify and
         copy it into the metadata the early variant's graph was captured with."""
         graph_key = (graph_key, "early")
-        # Graph-backed, like the in-graph build it replaces: one indexer call per layer,
-        # no free-memory row chunking (a chunked schedule would be rebound, not copied).
+        # Graph-backed: no dynamic-budget chunking, but SM120 can still split at
+        # its scheduler row cap. Replay updates each captured plan in place.
         metadata = self.make_forward_metadata_from_raw_verify(
             raw_metadata=raw_metadata,
             online_c128_state_slot_offset=self.online_c128_mtp.state_slot_offset(),

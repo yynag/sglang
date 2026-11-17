@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sys
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -31,6 +31,7 @@ from sglang.test.kernels.deepseek_v4.common import (
 
 register_cuda_ci(est_time=50, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=50, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=180, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 _is_xpu = is_xpu()
 if _is_xpu:
@@ -537,6 +538,521 @@ def test_fp4_paged_logits_balanced_matches_per_row_replay(heads, ratio, masked):
         assert torch.equal(
             score(True)[visible].view(torch.int32), expected[visible].view(torch.int32)
         )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12,
+    reason="SM120 DeepGEMM kernel/planner contract",
+)
+@pytest.mark.parametrize("ratio", [1, 2])
+@pytest.mark.parametrize("c4_fp4", [False, True])
+def test_sm120_full_topk_native_planner_replay(ratio, c4_fp4):
+    from sglang.kernels.ops.attention.dsv4.index_logits import flat_index_logits_tiles
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
+    from sglang.srt.layers.attention.dsv4.v41_indexer import make_full_topk_indexer
+    from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import (
+        get_deep_gemm_decode_data,
+    )
+    from sglang.srt.layers.attention.dsv4.v41_indexer.types import DecodeInputs
+
+    torch.manual_seed(1200 + ratio)
+    batch, heads, capacity, topk = 3, 32, 512 // ratio, 64
+    device = torch.device("cuda")
+    full_pages = torch.arange(
+        1, batch * 2 + 1, dtype=torch.int32, device=device
+    ).view(batch, 2)
+    req_table = (
+        full_pages[:, :, None] * 256 + torch.arange(256, device=device)
+    ).reshape(batch, 512).int()
+    slots = req_table[:, ::ratio].long() // ratio
+    num_pages = (batch * 2 + 1) * 256 // ratio // PAGE_SIZE
+    table = torch.zeros(num_pages, PAGE_SIZE * 68, dtype=torch.uint8, device=device)
+    keys = torch.randn(
+        num_pages * PAGE_SIZE, HEAD_DIM, dtype=torch.bfloat16, device=device
+    )
+    store_fp4_index_k_cache(
+        keys,
+        table,
+        torch.arange(keys.shape[0], device=device),
+        page_size=PAGE_SIZE,
+        rne=True,
+    )
+    pool = SimpleNamespace(
+        stage_layer_ids=(0,),
+        get_index_k_page_size=lambda _: PAGE_SIZE,
+        get_index_k_with_scale_buffer=lambda _: table,
+    )
+    backend = object.__new__(DeepseekV4AttnBackend)
+    backend.page_size = 256
+    backend.token_to_kv_pool = pool
+    backend.full_topk_indexer = make_full_topk_indexer(
+        token_to_kv_pool=pool,
+        req_to_token=req_table,
+        index_heads=heads,
+        index_topk=topk,
+    )
+    assert backend.full_topk_indexer.use_deep_gemm_decode
+    backend.decode_candidates = None
+    backend._deep_gemm_decode_ratios = backend._get_deep_gemm_decode_ratios(
+        SimpleNamespace(
+            compress_ratios=[ratio],
+            index_source_layer_ids=[0],
+            candidate_source_layer_id=-1,
+        )
+    )
+    backend.enable_deepseek_v4_fp4_indexer = c4_fp4
+    backend.dsa_topk_backend = SimpleNamespace(should_use_topk_v2=lambda: True)
+    lens = torch.tensor([1, 129, 193], dtype=torch.int32, device=device)
+    positions = (lens * ratio - 1).long()
+    core = SimpleNamespace(
+        page_table=full_pages,
+        c1_topk_lengths_clamp1=lens,
+        c2_topk_lengths_clamp1=lens,
+    )
+    q_lora = torch.randn(batch, heads * HEAD_DIM, dtype=torch.bfloat16, device=device)
+    weights = torch.randn(batch, heads, dtype=torch.bfloat16, device=device)
+    indexer = SimpleNamespace(
+        n_local_heads=heads,
+        n_heads=heads,
+        index_head_dim=HEAD_DIM,
+        index_topk=topk,
+        head_weight_scale=1.0,
+        wq_b=lambda x: (x, None),
+        head_weights_raw=lambda x: x,
+    )
+    freqs = torch.ones(512 * ratio, 32, dtype=torch.complex64, device=device)
+    out = torch.empty(batch, topk, dtype=torch.int32, device=device)
+
+    def inputs():
+        metadata = backend.init_forward_metadata_indexer(core, compress_ratio=ratio)
+        assert metadata.force_deep_gemm_metadata
+        return DecodeInputs(
+            indexer=indexer,
+            layer_id=0,
+            compress_ratio=ratio,
+            freqs_cis=freqs,
+            x=weights,
+            q_lora=q_lora,
+            positions=positions,
+            req_rows=torch.arange(batch, device=device),
+            paged_metadata=metadata,
+            is_verify=False,
+            out_page_indices=out,
+        )
+
+    def run():
+        backend.full_topk_indexer.topk_decode(inputs())
+
+    # These switches concern C4 FP8 and must not suppress a low-ratio FP4 plan.
+    with (
+        envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.override(True),
+        envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(True),
+    ):
+        for _ in range(3):
+            run()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        flat_slots = slots.flatten()
+        page, offset = flat_slots // PAGE_SIZE, flat_slots % PAGE_SIZE
+        payload = table[
+            page[:, None], offset[:, None] * 64 + torch.arange(64, device=device)
+        ]
+        scales = table[
+            page[:, None],
+            PAGE_SIZE * 64 + offset[:, None] * 4 + torch.arange(4, device=device),
+        ]
+        kv = (
+            payload.contiguous().view(torch.int8),
+            scales.contiguous().view(torch.int32).flatten(),
+        )
+        starts = torch.arange(batch, dtype=torch.int32, device=device) * capacity
+        for lengths in ([1, 127, 128], [129, 193, 65], [193, 1, 129]):
+            lens.copy_(torch.tensor(lengths, dtype=torch.int32, device=device))
+            positions.copy_((lens * ratio - 1).long())
+            q_lora.neg_()
+            out.fill_(-12345)
+            graph.replay()
+            data = get_deep_gemm_decode_data(inputs(), pool)
+            expected = next(
+                flat_index_logits_tiles(
+                    q=(data.q_fp4.squeeze(1), data.q_sf.squeeze(1)),
+                    kv=kv,
+                    weights=data.weights,
+                    starts=starts,
+                    lengths=lens,
+                    context_lengths=[capacity] * batch,
+                    budget_bytes=2 << 20,
+                )
+            )[1]
+            for row, length in enumerate(lengths):
+                pages = out[row][out[row] >= 0]
+                selected = (slots[row, :, None] == pages[None, :]).nonzero()[:, 0]
+                count = min(topk, length)
+                assert pages.numel() == selected.unique().numel() == count
+                assert (selected < length).all().item()
+                assert (out[row][count:] == -1).all().item()
+                torch.testing.assert_close(
+                    expected[row, selected].sort().values,
+                    expected[row, :length].topk(count).values.sort().values,
+                    atol=1e-4,
+                    rtol=1e-4,
+                )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12,
+    reason="SM120 grouped verify and shared early metadata",
+)
+@pytest.mark.parametrize("ratio", [1, 2])
+def test_sm120_early_verify_chunked_variants_replay(ratio):
+    """Real raw-verify builder, early install/copy and variant consumer dispatch."""
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.attention.deepseek_v4_backend import (
+        DeepseekV4AttnBackend,
+        DSV4RawVerifyMetadata,
+        _GraphBucket,
+    )
+    from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
+    from sglang.srt.layers.attention.dsv4.dsv41_sparse import DeepseekV41Indexer
+    from sglang.srt.layers.attention.dsv4.v41_indexer import (
+        make_candidate_indexer,
+        make_full_topk_indexer,
+    )
+    from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import (
+        DenseBlocksBackend,
+    )
+    from sglang.srt.model_executor.forward_mode import ForwardMode
+    from sglang.srt.model_executor.runner_utils import capture_mode
+
+    torch.manual_seed(1210 + ratio)
+    requests, group, heads, full_capacity, topk = 513, 8, 32, 1536, 512
+    rows = requests * group
+    device = torch.device("cuda")
+    full_pages = torch.arange(
+        1, requests * (full_capacity // 256) + 1, dtype=torch.int32, device=device
+    ).view(requests, -1)
+    req_table = (
+        full_pages[:, :, None] * 256 + torch.arange(256, device=device)
+    ).reshape(requests, full_capacity).int()
+    slots = (requests * full_capacity + 256) // ratio
+    keys = torch.randn(slots, HEAD_DIM, dtype=torch.bfloat16, device=device)
+    table = torch.zeros(
+        slots // PAGE_SIZE, PAGE_SIZE * 68, dtype=torch.uint8, device=device
+    )
+    store_fp4_index_k_cache(
+        keys, table, torch.arange(slots, device=device), page_size=PAGE_SIZE, rne=True
+    )
+    del keys
+    pool = SimpleNamespace(
+        stage_layer_ids=(0,),
+        request_window=None,
+        swa_req_ring_size=None,
+        full_to_swa_index_mapping=torch.arange(
+            requests * full_capacity + 256, device=device
+        ),
+        translate_loc_from_full_to_swa=lambda loc: loc,
+        get_index_k_page_size=lambda _: PAGE_SIZE,
+        get_index_k_with_scale_buffer=lambda _: table,
+    )
+    backend = object.__new__(DeepseekV4AttnBackend)
+    backend.page_size = 256
+    backend.req_to_token = req_table
+    backend.token_to_kv_pool = pool
+    backend.cuda_int32_kwargs = {"device": device, "dtype": torch.int32}
+    backend.MAX_SEQ_LEN_FOR_CAPTURE = full_capacity
+    backend.index_topk = topk
+    backend.present_ratios = backend.low_ratios = (ratio,)
+    backend.has_c4 = backend.has_c128 = False
+    backend.enable_deepseek_v4_fp4_indexer = False
+    backend.speculative_num_draft_tokens = group
+    backend.dsa_topk_backend = DSATopKBackend.SGL_KERNEL
+    backend.online_c128_mtp = SimpleNamespace(state_slot_offset=lambda: 0)
+    backend.cuda_graph_metadata_of_bucket_and_bs = {_GraphBucket.TARGET_VERIFY: {}}
+    backend._early_verify_metadata_ids = set()
+    backend.enable_early_verify_metadata()
+    backend.prefill_candidates, backend.decode_candidates = make_candidate_indexer(
+        token_to_kv_pool=pool,
+        req_to_token=req_table,
+        page_size=256,
+        candidate_topk_blocks=4,
+        candidate_block_size=8,
+    )
+    assert isinstance(backend.decode_candidates, DenseBlocksBackend)
+    backend.full_topk_indexer = make_full_topk_indexer(
+        token_to_kv_pool=pool,
+        req_to_token=req_table,
+        index_heads=heads,
+        index_topk=topk,
+    )
+    backend._deep_gemm_decode_ratios = backend._get_deep_gemm_decode_ratios(
+        SimpleNamespace(
+            compress_ratios=[ratio],
+            index_source_layer_ids=[0],
+            candidate_source_layer_id=0,
+        )
+    )
+    assert not backend._deep_gemm_decode_ratios
+    indexer = SimpleNamespace(
+        n_local_heads=heads,
+        n_heads=heads,
+        index_head_dim=HEAD_DIM,
+        rope_head_dim=64,
+        index_topk=topk,
+        head_weight_scale=HEAD_DIM**-0.5 * heads**-0.5,
+        is_candidate_source=True,
+        uses_candidates=False,
+        wq_b=lambda x: (x, None),
+        head_weights_raw=lambda x: x,
+    )
+    indexer.queries = MethodType(DeepseekV41Indexer.queries, indexer)
+    indexer.head_weights = MethodType(DeepseekV41Indexer.head_weights, indexer)
+    layer = SimpleNamespace(
+        layer_id=0,
+        compress_ratio=ratio,
+        indexer=indexer,
+        freqs_cis=torch.ones(full_capacity, 32, dtype=torch.complex64, device=device),
+    )
+    q = torch.randn(rows, heads * HEAD_DIM, dtype=torch.bfloat16, device=device)
+    weights = torch.randn(rows, heads, dtype=torch.bfloat16, device=device)
+    req_rows = torch.arange(
+        requests, device=device, dtype=torch.int32
+    ).repeat_interleave(group)
+    raw = DSV4RawVerifyMetadata(
+        req_pool_indices=torch.arange(requests, dtype=torch.int32, device=device),
+        seq_lens=torch.empty(requests, dtype=torch.int32, device=device),
+        out_cache_loc=torch.empty(rows, dtype=torch.int64, device=device),
+        extend_seq_lens=torch.full(
+            (requests,), group, dtype=torch.int32, device=device
+        ),
+    )
+    batch = SimpleNamespace(forward_mode=ForwardMode.TARGET_VERIFY)
+
+    def install(base, variant):
+        raw.seq_lens.fill_(base * ratio)
+        positions = base * ratio + torch.arange(group, device=device)
+        raw.out_cache_loc.copy_(req_table[:, positions].flatten())
+        with patch.object(capture_mode, "_capture_attention_variant", variant):
+            backend._install_early_verify_metadata(
+                graph_key=requests, raw_metadata=raw, out_cache_loc=raw.out_cache_loc
+            )
+
+    def run(variant):
+        with patch.object(capture_mode, "_capture_attention_variant", variant):
+            backend._low_ratio_index_topk(
+                layer,
+                weights,
+                q,
+                req_rows,
+                backend.forward_metadata.core_metadata.positions,
+                batch,
+            )
+
+    with envs.SGLANG_OPT_USE_TOPK_V2.override(True):
+        install(127, "candidate_unfiltered")
+        shared = backend.forward_metadata
+        metadata = (
+            shared.c1_indexer_metadata if ratio == 1 else shared.c2_indexer_metadata
+        )
+        assert metadata.rows_per_request == group
+        assert [(s.start, s.stop) for s, _ in metadata.row_chunks()] == [
+            (0, 4096), (4096, 4104)
+        ]
+        plans = tuple(metadata.deep_gemm_metadata)
+        topk_plans = tuple(metadata.topk_metadata_chunks)
+        pointers = tuple(t.data_ptr() for t in plans + topk_plans)
+        graphs = {}
+        for base, variant in (
+            (127, "candidate_unfiltered"), (129, "candidate_filtered")
+        ):
+            install(base, variant)
+            assert backend.forward_metadata is shared
+            for _ in range(3):
+                run(variant)
+            graphs[variant] = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graphs[variant]):
+                run(variant)
+        for base in (127, 129, 511, 513):
+            # Refresh through the filtered early path, then replay the already
+            # captured unfiltered graph: both variants share these plan owners.
+            install(base, "candidate_filtered")
+            assert all(a is b for a, b in zip(plans, metadata.deep_gemm_metadata))
+            assert all(
+                a is b for a, b in zip(topk_plans, metadata.topk_metadata_chunks)
+            )
+            assert tuple(t.data_ptr() for t in plans + topk_plans) == pointers
+            graphs["candidate_filtered"].replay()
+            graphs["candidate_unfiltered"].replay()
+            actual = shared.core_metadata.sparse_page_indices(ratio).clone()
+            with patch.object(
+                capture_mode, "_capture_attention_variant", "candidate_unfiltered"
+            ):
+                backend.forward_metadata = (
+                    backend.make_forward_metadata_from_raw_verify(
+                        raw, graph_backed=True
+                    )
+                )
+                run("candidate_unfiltered")
+            expected = backend.forward_metadata.core_metadata.sparse_page_indices(ratio)
+            torch.testing.assert_close(
+                actual.sort(-1).values, expected.sort(-1).values, atol=0, rtol=0
+            )
+            lens = shared.core_metadata.seq_lens_casual // ratio
+            assert torch.equal((actual >= 0).sum(-1), lens.clamp_max(topk).long())
+            assert (actual[actual < 0] == -1).all().item()
+            backend.forward_metadata = shared
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12,
+    reason="SM120 C4 paged consumer and native planner",
+)
+@pytest.mark.parametrize("fp4", [False, True])
+def test_sm120_c4_native_planner_consumer_replay(fp4):
+    """C4's real quantizer/forward versus flat DeepGEMM scores, not a low-ratio route."""
+    import deep_gemm
+
+    from sglang.kernels.ops.attention.dsv4.attn import fused_store_cache
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
+    from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
+    from sglang.srt.layers.attention.dsv4.indexer import FP8_DTYPE, C4Indexer
+    from sglang.srt.model_executor.forward_mode import ForwardMode
+
+    torch.manual_seed(1240 + fp4)
+    rows, heads, capacity, topk = 3, 32, 192, 64
+    device = torch.device("cuda")
+    pages = torch.arange(1, 10, dtype=torch.int32, device=device).view(rows, 3)
+    keys = torch.randn(10 * PAGE_SIZE, HEAD_DIM, dtype=torch.bfloat16, device=device)
+    table = torch.zeros(
+        10, PAGE_SIZE * (68 if fp4 else 132), dtype=torch.uint8, device=device
+    )
+    loc = torch.arange(keys.shape[0], device=device)
+    if fp4:
+        store_fp4_index_k_cache(keys, table, loc, page_size=PAGE_SIZE, rne=True)
+    else:
+        fused_store_cache(keys, table, loc, page_size=PAGE_SIZE, type="indexer")
+    backend = object.__new__(DeepseekV4AttnBackend)
+    backend.page_size = 256
+    backend.enable_deepseek_v4_fp4_indexer = fp4
+    backend.dsa_topk_backend = DSATopKBackend.SGL_KERNEL
+    backend.hisparse_coordinator = None
+    backend.debug_use_external_c4_sparse_indices = False
+    backend.token_to_kv_pool = SimpleNamespace(
+        get_index_k_with_scale_buffer=lambda **_: table
+    )
+    lens = torch.tensor([1, 127, 128], dtype=torch.int32, device=device)
+    positions = (lens * 4 - 1).long()
+    out = torch.empty(rows, topk, dtype=torch.int32, device=device)
+    raw_out = torch.empty_like(out)
+    core = SimpleNamespace(
+        page_table=pages,
+        c4_topk_lengths_raw=lens,
+        positions=positions,
+        c4_sparse_page_indices=out,
+        c4_sparse_raw_indices=raw_out,
+    )
+    indexer = SimpleNamespace(
+        layer_id=0,
+        use_fp4_indexer=fp4,
+        n_local_heads=heads,
+        head_dim=HEAD_DIM,
+        weight_scale=HEAD_DIM**-0.5 * heads**-0.5,
+        freqs_cis=torch.ones(1024, 32, dtype=torch.complex64, device=device),
+        wq_b=lambda x: (x, None),
+        weights_proj=lambda x: (x, None),
+    )
+    indexer.compute_q = MethodType(C4Indexer.compute_q, indexer)
+    indexer.compute_weights = MethodType(C4Indexer.compute_weights, indexer)
+    q = torch.randn(rows, heads * HEAD_DIM, dtype=torch.bfloat16, device=device)
+    weights = torch.randn(rows, heads, dtype=torch.bfloat16, device=device)
+    batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
+
+    def run():
+        backend.forward_metadata = SimpleNamespace(
+            indexer_metadata=backend.init_forward_metadata_indexer(core),
+            core_metadata=core,
+        )
+        backend.forward_c4_indexer(
+            x=weights,
+            q_lora=q,
+            c4_indexer=indexer,
+            forward_batch=batch,
+            skip_compressor=True,
+        )
+
+    slots = (
+        pages[:, :, None] * PAGE_SIZE + torch.arange(PAGE_SIZE, device=device)
+    ).flatten()
+    pg, off = slots // PAGE_SIZE, slots % PAGE_SIZE
+    dim = 64 if fp4 else 128
+    payload = table[pg[:, None], off[:, None] * dim + torch.arange(dim, device=device)]
+    scales = table[
+        pg[:, None],
+        PAGE_SIZE * dim + off[:, None] * 4 + torch.arange(4, device=device),
+    ]
+    kv = (
+        payload.contiguous().view(torch.int8 if fp4 else FP8_DTYPE),
+        scales.contiguous().view(torch.int32 if fp4 else torch.float32).flatten(),
+    )
+    starts = torch.arange(rows, dtype=torch.int32, device=device) * capacity
+    with (
+        envs.SGLANG_OPT_USE_TOPK_V2.override(True),
+        envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.override(True),
+        envs.SGLANG_OPT_USE_TILELANG_INDEXER.override(False),
+        envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(False),
+    ):
+        for _ in range(3):
+            run()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        for lengths in ([1, 127, 128], [129, 191, 65], [63, 64, 129]):
+            lens.copy_(torch.tensor(lengths, dtype=torch.int32, device=device))
+            positions.copy_((lens * 4 - 1).long())
+            q.neg_()
+            graph.replay()
+            packed_q, w = indexer.compute_q(q, positions, weights)
+            if fp4:
+                expected = deep_gemm.fp8_fp4_mqa_logits(
+                    packed_q,
+                    kv,
+                    w.squeeze(-1).float(),
+                    starts,
+                    starts + lens,
+                    False,
+                    capacity,
+                    logits_dtype=torch.float32,
+                )
+            else:
+                expected = deep_gemm.fp8_mqa_logits(
+                    packed_q,
+                    kv,
+                    w.squeeze(-1).float(),
+                    starts,
+                    starts + lens,
+                    False,
+                    capacity,
+                )
+            for row, length in enumerate(lengths):
+                selected = raw_out[row][raw_out[row] >= 0].long()
+                count = min(topk, length)
+                assert selected.numel() == selected.unique().numel() == count
+                assert (selected < length).all().item()
+                assert (out[row][count:] == -1).all().item()
+                expected_pages = (
+                    pages[row, selected // PAGE_SIZE] * PAGE_SIZE + selected % PAGE_SIZE
+                )
+                torch.testing.assert_close(
+                    out[row, :count], expected_pages.int(), atol=0, rtol=0
+                )
+                torch.testing.assert_close(
+                    expected[row, selected].sort().values,
+                    expected[row, :length].topk(count).values.sort().values,
+                    atol=1e-4,
+                    rtol=1e-4,
+                )
 
 
 @pytest.mark.skipif(

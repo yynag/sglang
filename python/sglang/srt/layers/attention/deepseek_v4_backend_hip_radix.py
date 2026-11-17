@@ -1126,6 +1126,7 @@ class DeepseekV4HipRadixBackend(
         else:
             raise ValueError(f"Unsupported indexer {compress_ratio = }")
         return PagedIndexerMetadata(
+            use_deep_gemm_metadata=False,
             page_size=self.page_size,
             compressed_page_size=self.token_to_kv_pool.get_index_k_page_size(
                 compress_ratio

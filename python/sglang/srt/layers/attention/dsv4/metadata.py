@@ -22,7 +22,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
-from sglang.srt.utils import is_hip, is_sm120_supported, is_xpu
+from sglang.srt.utils import is_hip, is_sm120_supported
 
 logger = logging.getLogger(__name__)
 
@@ -186,6 +186,8 @@ class PagedIndexerMetadata:
     page_table: torch.Tensor
     compressed_seq_lens: torch.Tensor
     use_topk_v2: bool
+    # Selected by the backend's actual paged scorers, not C4-only fallback flags.
+    use_deep_gemm_metadata: bool = True
     force_deep_gemm_metadata: bool = False
     use_prefill_cuda_graph: bool = False
     # Indexer source compression ratio: 4 for c4, 1 or 2 for the dsv41 sources.
@@ -193,7 +195,7 @@ class PagedIndexerMetadata:
     rows_per_request: int = 1
     # Schedule DeepGEMM's current paged API: varlen rows grouped by request indices.
     deep_gemm_varlen: bool = False
-    # A list when the dynamic-budget forward is row-chunked: one schedule per chunk.
+    # One tensor per call, or a list of tensors for budget/SM120-cap row chunks.
     deep_gemm_metadata: Any = field(init=False, repr=False)
     # The request of each query row of a chunk (all rows if unchunked) when the
     # schedule is varlen, else None; a shorter last chunk takes its prefix.
@@ -212,9 +214,7 @@ class PagedIndexerMetadata:
     )
 
     def __post_init__(self):
-        if (
-            is_hip() or is_xpu() or envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
-        ) and not self.force_deep_gemm_metadata:
+        if not self.use_deep_gemm_metadata:
             self.deep_gemm_metadata = None
         else:
             import deep_gemm
@@ -326,10 +326,10 @@ class PagedIndexerMetadata:
         )
 
     def _mqa_logits_budget(self, *, num_rows: int) -> Optional[int]:
-        """Free-memory budget for this forward's logits; None disables chunking.
+        """Free-memory budget for logits; None skips budget-based chunking.
 
-        Graph-backed forwards keep a single call: their shapes are fixed at
-        capture and the free-memory read would sync the host mid-capture.
+        Graph-backed forwards skip the dynamic budget: shapes are fixed at
+        capture, but the SM120 scheduler's row cap can still require chunks.
         """
         if self.use_prefill_cuda_graph or not self.compressed_seq_lens.is_cuda:
             return None
@@ -379,7 +379,71 @@ class PagedIndexerMetadata:
         return chunks
 
     def copy_(self, other: PagedIndexerMetadata):
-        # A chunked schedule list has no in-place copy; rebind it instead.
+        check_eq_fields = [
+            "page_size",
+            "compressed_page_size",
+            "compress_ratio",
+            "use_deep_gemm_metadata",
+            "force_deep_gemm_metadata",
+            "use_prefill_cuda_graph",
+            "use_topk_v2",
+            "rows_per_request",
+            "deep_gemm_varlen",
+        ]
+        if self.use_prefill_cuda_graph or other.use_prefill_cuda_graph:
+            # A graph bucket fixes the row grouping, capacity and chunk layout.
+            # Validate every buffer before copying: copy_ must not broadcast a
+            # shorter plan, silently truncate one, or rebind captured addresses.
+            for name in check_eq_fields + ["rows_per_chunk"]:
+                if getattr(self, name) != getattr(other, name):
+                    raise ValueError(f"graph-backed indexer metadata changed {name}")
+            copies = []
+            for name in (
+                "page_table",
+                "compressed_seq_lens",
+                "deep_gemm_metadata",
+                "deep_gemm_indices",
+                "topk_metadata",
+                "topk_metadata_chunks",
+            ):
+                dst, src = getattr(self, name), getattr(other, name)
+                if dst is None and src is None:
+                    continue
+                if isinstance(dst, list):
+                    if not isinstance(src, list) or len(dst) != len(src):
+                        raise ValueError(
+                            f"graph-backed indexer metadata changed {name} chunks"
+                        )
+                    pairs = [
+                        (f"{name}[{i}]", d, s)
+                        for i, (d, s) in enumerate(zip(dst, src))
+                    ]
+                else:
+                    pairs = [(name, dst, src)]
+                for label, d, s in pairs:
+                    if (
+                        not isinstance(d, torch.Tensor)
+                        or not isinstance(s, torch.Tensor)
+                        or d.layout != torch.strided
+                        or s.layout != torch.strided
+                        or d.shape != s.shape
+                        or d.stride() != s.stride()
+                        or d.dtype != s.dtype
+                        or d.device != s.device
+                    ):
+                        raise ValueError(
+                            f"graph-backed indexer metadata changed {label} "
+                            "tensor layout; "
+                            "a different layout needs a separate graph bucket"
+                        )
+                    copies.append((d, s))
+            for dst, src in copies:
+                dst.copy_(src)
+            self.mqa_logits_budget_bytes = other.mqa_logits_budget_bytes
+            self.nonpaged_plan = None
+            return
+
+        # Eager dynamic-budget forwards can change their chunk layout.
         chunked = isinstance(self.deep_gemm_metadata, list) or isinstance(
             other.deep_gemm_metadata, list
         )
@@ -403,16 +467,7 @@ class PagedIndexerMetadata:
         copy_metadata(
             src=other,
             dst=self,
-            check_eq_fields=[
-                "page_size",
-                "compressed_page_size",
-                "compress_ratio",
-                "force_deep_gemm_metadata",
-                "use_prefill_cuda_graph",
-                "use_topk_v2",
-                "rows_per_request",
-                "deep_gemm_varlen",
-            ],
+            check_eq_fields=check_eq_fields,
             copy_fields=copy_fields,
             assign_fields=assign_fields,
         )

@@ -88,6 +88,7 @@ class TestDSV4PagedIndexerMetadata(CustomTestCase):
                 page_table=torch.zeros((1, 1), dtype=torch.int32),
                 compressed_seq_lens=torch.tensor([65], dtype=torch.int32),
                 use_topk_v2=False,
+                use_deep_gemm_metadata=False,
             )
 
         self.assertIsNone(metadata.deep_gemm_metadata)
@@ -787,7 +788,6 @@ class TestPagedIndexerMetadataChunking(CustomTestCase):
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(False),
             envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.override(False),
             patch(f"{_METADATA}.is_hip", return_value=False),
-            patch(f"{_METADATA}.is_xpu", return_value=False),
             patch(f"{_METADATA}._IS_SM120", False),
             patch.object(
                 PagedIndexerMetadata, "_mqa_logits_budget", return_value=budget
